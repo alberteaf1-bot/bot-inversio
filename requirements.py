@@ -1,9 +1,0 @@
-streamlit
-
-plotly
-
-yfinance
-
-pandas
-
-numpy
