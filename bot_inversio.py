@@ -1,12 +1,18 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
+# ----------------------------------------------------------------------------
+# Utilitats
+# ----------------------------------------------------------------------------
+
 
 def _num(val: Any) -> Optional[float]:
-    """Converteix un valor a float finit o retorna None."""
     if val is None:
         return None
     try:
@@ -21,119 +27,202 @@ def _clip01(x: float) -> float:
 
 
 def _interp_score(val: Optional[float], worst: float, best: float, higher_is_better: bool = True) -> Optional[float]:
-    """
-    Normalitza un indicador de forma lineal contínua a [0, 1].
-    - higher_is_better=True: worst -> 0.0, best -> 1.0
-    - higher_is_better=False: worst -> 1.0, best -> 0.0 (ex. PER, Deute/EBITDA)
-    """
+    """Normalització lineal a [0,1]. worst -> 0, best -> 1 (en qualsevol direcció)."""
     v = _num(val)
     if v is None:
         return None
-    if higher_is_better:
-        if best == worst:
-            return 0.5
-        return _clip01((v - worst) / (best - worst))
-    else:
-        if worst == best:
-            return 0.5
-        return _clip01((worst - v) / (worst - best))
+    if best == worst:
+        return 0.5
+    return _clip01((v - worst) / (best - worst))
 
 
-def _calcular_rsi(series: pd.Series, period: int = 14) -> Optional[float]:
+def _rsi_wilder(series: pd.Series, period: int = 14) -> Optional[float]:
+    """RSI amb suavitzat de Wilder (estàndard); l'original usava mitjana simple."""
     if series is None or len(series) < period + 1:
         return None
     delta = series.diff().dropna()
-    gain = delta.clip(lower=0.0).rolling(period).mean()
-    loss = (-delta.clip(upper=0.0)).rolling(period).mean()
-    rs = gain / loss.replace(0.0, np.nan)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    val = _num(rsi.iloc[-1])
-    return val
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    ag = _num(gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean().iloc[-1])
+    al = _num(loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean().iloc[-1])
+    if ag is None or al is None:
+        return None
+    if al == 0:
+        return 100.0 if ag > 0 else 50.0
+    return float(100.0 - 100.0 / (1.0 + ag / al))
+
+
+# Ancores sectorials aproximades (PER, EV/EBITDA) de llarg termini. Són orientatives i editables.
+ANCORES_SECTOR: Dict[str, Tuple[float, float]] = {
+    "Technology": (24.0, 16.0),
+    "Healthcare": (20.0, 13.0),
+    "Financial Services": (11.0, 8.0),
+    "Consumer Cyclical": (19.0, 11.0),
+    "Consumer Defensive": (20.0, 13.0),
+    "Industrials": (20.0, 13.0),
+    "Energy": (12.0, 6.0),
+    "Utilities": (17.0, 10.0),
+    "Real Estate": (28.0, 17.0),
+    "Basic Materials": (15.0, 8.0),
+    "Communication Services": (18.0, 10.0),
+}
+ANCORA_DEFECTE = (18.0, 11.0)
+
+
+def descarregar_dades_yf(ticker: str) -> Dict[str, Any]:
+    """Descàrrega bruta (picklable) per poder-la cachejar a Streamlit."""
+    stock = yf.Ticker(ticker)
+    try:
+        info = stock.info or {}
+    except Exception:
+        info = {}
+    hist = stock.history(period="5y", auto_adjust=True)
+
+    def _safe(attr: str) -> pd.DataFrame:
+        try:
+            df = getattr(stock, attr)
+            return df if df is not None else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+
+    if not info.get("currentPrice") and not info.get("regularMarketPrice"):
+        try:
+            fi = stock.fast_info
+            info["regularMarketPrice"] = fi.get("lastPrice")
+            info.setdefault("currency", fi.get("currency"))
+        except Exception:
+            pass
+
+    return {
+        "info": info,
+        "hist": hist,
+        "cashflow": _safe("cashflow"),
+        "balance": _safe("balance_sheet"),
+        "income": _safe("income_stmt"),
+    }
+
+
+def simular_rutes(
+    p0: float,
+    mu_cont_anual: float,
+    vol_diaria: float,
+    n_dies: int,
+    n_sim: int,
+    rng: np.random.Generator,
+    df_t: float = 5.0,
+    sigma_vol: float = 0.20,
+) -> np.ndarray:
+    """
+    Monte Carlo millorat respecte al GBM normal:
+    - Shocks Student-t (cues gruixudes) normalitzats a variància 1.
+    - Incertesa de volatilitat: cada ruta té un multiplicador lognormal de vol.
+    - Variables antitètiques (menys soroll de mostreig).
+    - Correcció de mitjana: l'E[S_T] simulat = p0 * exp(mu_cont_anual * n_dies/252) exactament.
+    """
+    mig = int(np.ceil(n_sim / 2))
+    z = rng.standard_t(df_t, size=(n_dies, mig)) * np.sqrt((df_t - 2.0) / df_t)
+    z = np.concatenate([z, -z], axis=1)[:, :n_sim]
+    vol_mult = np.exp(sigma_vol * rng.standard_normal(n_sim) - 0.5 * sigma_vol ** 2)
+    cum = np.cumsum(z * (vol_diaria * vol_mult), axis=0)
+    mu_total = mu_cont_anual * n_dies / 252.0
+    ajust = mu_total - np.log(np.mean(np.exp(cum[-1])))
+    cum = cum + ajust * (np.arange(1, n_dies + 1)[:, None] / n_dies)
+    rutes = np.empty((n_dies + 1, n_sim), dtype=float)
+    rutes[0] = p0
+    rutes[1:] = p0 * np.exp(cum)
+    return rutes
 
 
 @dataclass
 class ConfigAnalisi1Any:
     dies_any: int = 252
     n_simulacions: int = 2500
-    taxa_lliure_risc: float = 0.042   # ~4.2% orientatiu
-    prima_risc_mercat: float = 0.050 # ~5.0% ERP
+    taxa_lliure_risc: float = 0.042
+    prima_risc_mercat: float = 0.050
     creixement_terminal: float = 0.025
-    pes_fonamental_preu: float = 0.55 # Pes del preu objectiu fonamental vs. montecarlo
+    taxa_impostos: float = 0.21
+    shrink_analistes: float = 0.40    # fracció de l'upside dels analistes que ens creiem
+    pes_capm: float = 0.35            # pes mínim del rendiment CAPM en la deriva
+    df_t: float = 5.0
+    sigma_vol_incert: float = 0.20
     seed: int = 42
 
 
 class BotInversio1Any:
-    """
-    Motor d'anàlisi quantitativa per a l'avaluació d'inversions a 1 any:
-    - Extracció àmplia de mètriques públiques (valoració, rendibilitat, creixement, balanç, cash flow, tècnic i risc).
-    - Puntuació ponderada de 0 a 100 amb cobertura i confiança de dades.
-    - Estimació de preu objectiu a 12 mesos (múltiples/FCF + simulació GBM Monte Carlo).
-    """
-
     def __init__(self, ticker: str, config: Optional[ConfigAnalisi1Any] = None):
         self.ticker = ticker.strip().upper()
         self.cfg = config or ConfigAnalisi1Any()
-        self.stock = yf.Ticker(self.ticker)
         self.info: Dict[str, Any] = {}
-        self.hist_1y: pd.DataFrame = pd.DataFrame()
-        self.hist_2y: pd.DataFrame = pd.DataFrame()
-        self.cashflow: pd.DataFrame = pd.DataFrame()
-        self.balance: pd.DataFrame = pd.DataFrame()
-        self.income: pd.DataFrame = pd.DataFrame()
+        self.hist_full = pd.DataFrame()
+        self.hist_2y = pd.DataFrame()
+        self.hist_1y = pd.DataFrame()
+        self.cashflow = pd.DataFrame()
+        self.balance = pd.DataFrame()
+        self.income = pd.DataFrame()
         self.preu_actual: Optional[float] = None
-        self.moneda: str = "USD"
-        self.nom_empresa: str = self.ticker
+        self.moneda = "USD"
+        self.nom_empresa = self.ticker
+        self.sector = "N/D"
+        self.es_financera = False
+        self.fx_mismatch = False
+        self.avisos: List[str] = []
+        self._cache_m: Optional[Dict[str, Optional[float]]] = None
 
-    def carregar_dades(self) -> Tuple[bool, str]:
+    # ------------------------------------------------------------------ dades
+    def carregar_dades(self, dades: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
         try:
-            info = self.stock.info or {}
-            hist_2y = self.stock.history(period="2y", auto_adjust=True)
-            if hist_2y is None or hist_2y.empty or "Close" not in hist_2y.columns:
+            if dades is None:
+                dades = descarregar_dades_yf(self.ticker)
+            info = dict(dades.get("info") or {})
+            hist = dades.get("hist")
+            if hist is None or hist.empty or "Close" not in hist.columns:
                 return False, f"No s'ha pogut descarregar l'històric de preus per a '{self.ticker}'."
+            hist = hist[~hist.index.duplicated(keep="last")].sort_index().dropna(subset=["Close"])
+            if len(hist) < 60:
+                return False, f"Històric massa curt per a '{self.ticker}' ({len(hist)} sessions)."
 
             self.info = info
-            self.hist_2y = hist_2y.dropna(subset=["Close"])
-            self.hist_1y = self.hist_2y.tail(self.cfg.dies_any).copy()
-            if self.hist_1y.empty:
-                self.hist_1y = self.hist_2y.copy()
+            self.hist_full = hist
+            self.hist_2y = hist.tail(2 * self.cfg.dies_any).copy()
+            self.hist_1y = hist.tail(self.cfg.dies_any).copy()
+            self.cashflow = dades.get("cashflow", pd.DataFrame())
+            self.balance = dades.get("balance", pd.DataFrame())
+            self.income = dades.get("income", pd.DataFrame())
 
             self.nom_empresa = info.get("longName") or info.get("shortName") or self.ticker
             self.moneda = info.get("currency") or "USD"
+            self.sector = info.get("sector") or "N/D"
+            self.es_financera = self.sector == "Financial Services"
 
-            preu_hist = _num(self.hist_1y["Close"].iloc[-1])
+            preu_hist = _num(hist["Close"].iloc[-1])
             preu_info = _num(info.get("currentPrice")) or _num(info.get("regularMarketPrice"))
             self.preu_actual = preu_info if preu_info is not None else preu_hist
-
             if self.preu_actual is None or self.preu_actual <= 0:
                 return False, f"Preu actual no vàlid per a '{self.ticker}'."
 
-            # Estats financers anuals (opcional, poden venir buits en alguns tickers)
-            try:
-                cf = self.stock.cashflow
-                if cf is not None and not cf.empty:
-                    self.cashflow = cf
-            except Exception:
-                self.cashflow = pd.DataFrame()
-
-            try:
-                bs = self.stock.balance_sheet
-                if bs is not None and not bs.empty:
-                    self.balance = bs
-            except Exception:
-                self.balance = pd.DataFrame()
-
-            try:
-                inc = self.stock.income_stmt
-                if inc is not None and not inc.empty:
-                    self.income = inc
-            except Exception:
-                self.income = pd.DataFrame()
-
+            # Avisos de qualitat de dades
+            fin_cur = info.get("financialCurrency")
+            if fin_cur and fin_cur != self.moneda:
+                self.fx_mismatch = True
+                self.avisos.append(
+                    f"Moneda de cotització ({self.moneda}) ≠ moneda dels estats financers ({fin_cur}): "
+                    "s'ometen els mètodes de valoració per acció (P/E, EV/EBITDA, DCF, P/BV)."
+                )
+            dies_vells = (pd.Timestamp.now(tz=hist.index.tz) - hist.index[-1]).days
+            if dies_vells > 7:
+                self.avisos.append(f"L'últim preu de l'històric té {dies_vells} dies d'antiguitat.")
+            if len(hist) < 2 * self.cfg.dies_any:
+                self.avisos.append("Històric inferior a 2 anys: vol. i momentum menys fiables.")
+            if self.sector == "N/D":
+                self.avisos.append("Sector desconegut: s'usen múltiples d'ancoratge genèrics.")
+            self._cache_m = None
             return True, "Dades carregades correctament."
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             return False, f"Error carregant dades de '{self.ticker}': {e}"
 
-    def _serie_fila(self, df: pd.DataFrame, candidats: List[str]) -> Optional[pd.Series]:
+    # --------------------------------------------------------------- helpers
+    @staticmethod
+    def _serie_fila(df: pd.DataFrame, candidats: List[str]) -> Optional[pd.Series]:
         if df is None or df.empty:
             return None
         for nom in candidats:
@@ -143,89 +232,103 @@ class BotInversio1Any:
                     return s.astype(float)
         return None
 
-    def _cagr_serie(self, s: Optional[pd.Series]) -> Optional[float]:
+    @staticmethod
+    def _cagr_serie(s: Optional[pd.Series]) -> Optional[float]:
         if s is None or len(s) < 2:
             return None
-        # En yfinance els estats financers solen ordenar columnes de més recent a més antiga
-        vals = [float(x) for x in s.values if _num(x) is not None]
-        if len(vals) < 2:
+        s = s.sort_index()  # antic -> recent
+        v_ini, v_fi = float(s.iloc[0]), float(s.iloc[-1])
+        n = len(s) - 1
+        if v_ini <= 0 or v_fi <= 0:
             return None
-        # Assegurem ordre cronològic (antic -> recent)
-        if s.index[0] > s.index[-1]:
-            vals = list(reversed(vals))
-        v_ini, v_fi = vals[0], vals[-1]
-        n_periodes = len(vals) - 1
-        if v_ini <= 0 or v_fi <= 0 or n_periodes <= 0:
+        return float((v_fi / v_ini) ** (1.0 / n) - 1.0)
+
+    def _serie_fcf(self) -> Optional[pd.Series]:
+        s = self._serie_fila(self.cashflow, ["Free Cash Flow"])
+        if s is not None:
+            return s
+        ocf = self._serie_fila(self.cashflow, ["Operating Cash Flow", "Total Cash From Operating Activities"])
+        capex = self._serie_fila(self.cashflow, ["Capital Expenditure", "Capital Expenditures"])
+        if ocf is None or capex is None:
             return None
-        return float((v_fi / v_ini) ** (1.0 / n_periodes) - 1.0)
+        df = pd.concat([ocf.rename("o"), capex.rename("c")], axis=1, join="inner")
+        if df.empty:
+            return None
+        return df["o"] + np.where(df["c"] < 0, df["c"], -df["c"])
+
+    def _vol_pronostic(self, log_rets: pd.Series) -> float:
+        """Vol. diària prevista: barreja EWMA (recent) + 1Y + llarg termini (mean reversion)."""
+        if len(log_rets) < 30:
+            return 0.015
+        v_ewma = float(np.sqrt(log_rets.tail(504).pow(2).ewm(alpha=0.06, adjust=False).mean().iloc[-1]))
+        v_1y = float(log_rets.tail(252).std())
+        v_lr = float(log_rets.tail(1260).std())
+        return float(np.clip(0.4 * v_ewma + 0.3 * v_1y + 0.3 * v_lr, 0.004, 0.08))
+
+    # -------------------------------------------------------------- mètriques
+    def metriques(self) -> Dict[str, Optional[float]]:
+        if self._cache_m is None:
+            self._cache_m = self._calc_metriques()
+        return self._cache_m
 
     def extreure_metriques_completes(self) -> Dict[str, Optional[float]]:
+        return self.metriques()
+
+    def _calc_metriques(self) -> Dict[str, Optional[float]]:
         i = self.info
-        g = lambda k: _num(i.get(k))
+        g = lambda k: _num(i.get(k))  # noqa: E731
 
-        fcf_s = self._serie_fila(self.cashflow, ["Free Cash Flow"])
-        if fcf_s is None:
-            ocf = self._serie_fila(self.cashflow, ["Operating Cash Flow", "Total Cash From Operating Activities"])
-            capex = self._serie_fila(self.cashflow, ["Capital Expenditure", "Capital Expenditures"])
-            if ocf is not None and capex is not None:
-                n = min(len(ocf), len(capex))
-                # CapEx sovint ve en negatiu a yfinance; si és positiu el restem
-                cx_vals = capex.iloc[:n].values
-                op_vals = ocf.iloc[:n].values
-                fcf_vals = [
-                    op_vals[k] + cx_vals[k] if cx_vals[k] < 0 else op_vals[k] - cx_vals[k]
-                    for k in range(n)
-                ]
-                fcf_s = pd.Series(fcf_vals, index=ocf.index[:n])
-
+        fcf_s = self._serie_fcf()
         fcf_actual = _num(fcf_s.iloc[0]) if (fcf_s is not None and len(fcf_s) > 0) else None
         fcf_cagr = self._cagr_serie(fcf_s)
 
-        cap_mercat = g("marketCap")
-        fcf_yield = (fcf_actual / cap_mercat) if (fcf_actual is not None and cap_mercat and cap_mercat > 0) else None
+        cap = g("marketCap")
+        fcf_yield = (fcf_actual / cap) if (fcf_actual is not None and cap and cap > 0) else None
 
-        deute_total = g("totalDebt")
-        caixa_total = g("totalCash")
-        ebitda = g("ebitda")
-        deute_net = (deute_total - (caixa_total or 0.0)) if deute_total is not None else None
+        deute, caixa, ebitda = g("totalDebt"), g("totalCash"), g("ebitda")
+        deute_net = (deute - (caixa or 0.0)) if deute is not None else None
         nd_ebitda = (deute_net / ebitda) if (deute_net is not None and ebitda and ebitda > 0) else None
 
-        # Mètriques tècniques i momentum a 1 any
+        ni_s = self._serie_fila(self.income, ["Net Income", "Net Income Common Stockholders"])
+        ni = _num(ni_s.iloc[0]) if ni_s is not None else None
+        conv_fcf = (fcf_actual / ni) if (fcf_actual is not None and ni and ni > 0) else None
+
+        ebit_s = self._serie_fila(self.income, ["EBIT", "Operating Income"])
+        int_s = self._serie_fila(self.income, ["Interest Expense", "Interest Expense Non Operating"])
+        cobertura_int = None
+        if ebit_s is not None and int_s is not None:
+            ie = abs(_num(int_s.iloc[0]) or 0.0)
+            eb = _num(ebit_s.iloc[0])
+            if ie > 0 and eb is not None:
+                cobertura_int = eb / ie
+
         close = self.hist_1y["Close"]
-        ret_1y = float((close.iloc[-1] / close.iloc[0]) - 1.0) if len(close) >= 2 else None
+        p = self.preu_actual
+        ret_1y = float(close.iloc[-1] / close.iloc[0] - 1.0) if len(close) >= 2 else None
+        mom_12_1 = float(close.iloc[-22] / close.iloc[0] - 1.0) if len(close) >= 60 else None
         sma50 = _num(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else None
         sma200 = _num(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else None
-        dist_sma50 = ((self.preu_actual / sma50) - 1.0) if (self.preu_actual and sma50 and sma50 > 0) else None
-        dist_sma200 = ((self.preu_actual / sma200) - 1.0) if (self.preu_actual and sma200 and sma200 > 0) else None
-        rsi14 = _calcular_rsi(close, 14)
+        d50 = (p / sma50 - 1.0) if (sma50 and sma50 > 0) else None
+        d200 = (p / sma200 - 1.0) if (sma200 and sma200 > 0) else None
+        rsi14 = _rsi_wilder(close, 14)
+        high = _num(close.max())
+        dd52 = (p / high - 1.0) if (high and high > 0) else None
 
-        high_52w = _num(close.max())
-        drawdown_52w = ((self.preu_actual / high_52w) - 1.0) if (self.preu_actual and high_52w and high_52w > 0) else None
-
-        # Volatilitat i risc diari
         log_rets = np.log(close / close.shift(1)).dropna()
-        vol_diaria = float(log_rets.std()) if len(log_rets) > 10 else None
-        vol_anual = float(vol_diaria * np.sqrt(self.cfg.dies_any)) if vol_diaria is not None else None
+        vol_d = float(log_rets.std()) if len(log_rets) > 10 else None
+        vol_anual = float(vol_d * np.sqrt(self.cfg.dies_any)) if vol_d is not None else None
+        max_dd = float(((close / close.cummax()) - 1.0).min()) if len(close) else None
 
-        # Max drawdown 1y
-        rolling_max = close.cummax()
-        dd_series = (close / rolling_max) - 1.0
-        max_dd_1y = float(dd_series.min()) if len(dd_series) > 0 else None
+        var95 = float(np.percentile(log_rets, 5)) if len(log_rets) > 10 else None
+        cvar95 = var95
+        if var95 is not None and (log_rets <= var95).any():
+            cvar95 = float(log_rets[log_rets <= var95].mean())
 
-        # VaR 95% i CVaR 95% diari
-        var95_diari = float(np.percentile(log_rets, 5)) if len(log_rets) > 10 else None
-        if var95_diari is not None and len(log_rets[log_rets <= var95_diari]) > 0:
-            cvar95_diari = float(log_rets[log_rets <= var95_diari].mean())
-        else:
-            cvar95_diari = var95_diari
-
-        beta = g("beta")
-        sharpe_aprox = None
+        sharpe = None
         if ret_1y is not None and vol_anual and vol_anual > 0:
-            sharpe_aprox = float((ret_1y - self.cfg.taxa_lliure_risc) / vol_anual)
+            sharpe = float((ret_1y - self.cfg.taxa_lliure_risc) / vol_anual)
 
         return {
-            # Valoració
             "PER Trailing": g("trailingPE"),
             "PER Forward": g("forwardPE"),
             "PEG": g("trailingPegRatio") or g("pegRatio"),
@@ -233,84 +336,80 @@ class BotInversio1Any:
             "EV/EBITDA": g("enterpriseToEbitda"),
             "EV/Sales": g("enterpriseToRevenue"),
             "FCF Yield": fcf_yield,
-            # Rendibilitat
             "ROE": g("returnOnEquity"),
             "ROA": g("returnOnAssets"),
             "Marge Brut": g("grossMargins"),
             "Marge Operatiu": g("operatingMargins"),
             "Marge Net": g("profitMargins"),
-            # Creixement
+            "Conversió FCF/Benefici": conv_fcf,
             "Creixement Ingressos YoY": g("revenueGrowth"),
             "Creixement Beneficis YoY": g("earningsGrowth") or g("earningsQuarterlyGrowth"),
             "FCF CAGR Històric": fcf_cagr,
-            # Balanç i Solvència
             "Current Ratio": g("currentRatio"),
             "Quick Ratio": g("quickRatio"),
             "Deute / Patrimoni (%)": g("debtToEquity"),
             "Deute Net / EBITDA": nd_ebitda,
-            # Momentum i Risc (1 any)
+            "Cobertura d'Interessos": cobertura_int,
             "Rendiment 1Y": ret_1y,
-            "Distància SMA50": dist_sma50,
-            "Distància SMA200": dist_sma200,
+            "Momentum 12-1": mom_12_1,
+            "Distància SMA50": d50,
+            "Distància SMA200": d200,
             "RSI (14)": rsi14,
-            "Drawdown vs Màxim 52S": drawdown_52w,
-            "Max Drawdown 1Y": max_dd_1y,
+            "Drawdown vs Màxim 52S": dd52,
+            "Max Drawdown 1Y": max_dd,
             "Volatilitat Anualitzada": vol_anual,
-            "VaR 95% Diari": var95_diari,
-            "CVaR 95% Diari": cvar95_diari,
-            "Beta": beta,
-            "Sharpe Aprox (1Y)": sharpe_aprox,
-            # Dades base útils
+            "VaR 95% Diari": var95,
+            "CVaR 95% Diari": cvar95,
+            "Beta": g("beta"),
+            "Sharpe Aprox (1Y)": sharpe,
             "EPS Trailing": g("trailingEps"),
             "EPS Forward": g("forwardEps"),
+            "Valor Comptable/Acció": g("bookValue"),
+            "Rendiment Dividend": g("trailingAnnualDividendYield"),
             "FCF Actual": fcf_actual,
-            "Accions": g("sharesOutstanding") or g("impliedSharesOutstanding"),
-            "Caixa Total": caixa_total,
-            "Deute Total": deute_total,
+            "Caixa Total": caixa,
+            "Deute Total": deute,
+            "Nº Analistes": g("numberOfAnalystOpinions"),
             "Target Analyst Consensus": g("targetMeanPrice"),
         }
 
-    def estimar_wacc(self) -> float:
-        m = self.extreure_metriques_completes()
-        beta = _num(m.get("Beta"))
-        beta_net = float(np.clip(beta if beta is not None else 1.0, 0.4, 2.5))
-        ke = self.cfg.taxa_lliure_risc + beta_net * self.cfg.prima_risc_mercat
+    # ---------------------------------------------------------- cost de capital
+    def _ke(self) -> float:
+        beta = _num(self.metriques().get("Beta"))
+        beta = float(np.clip(beta if beta is not None else 1.0, 0.3, 2.5))
+        beta_adj = 0.67 * beta + 0.33  # ajust de Blume (reversió de beta a 1)
+        return self.cfg.taxa_lliure_risc + beta_adj * self.cfg.prima_risc_mercat
 
+    def estimar_wacc(self) -> float:
+        m = self.metriques()
+        ke = self._ke()
         deute = _num(m.get("Deute Total")) or 0.0
         cap = _num(self.info.get("marketCap")) or 0.0
-        total_cap = deute + cap
-        if total_cap > 0 and deute > 0:
-            we = cap / total_cap
-            wd = deute / total_cap
-            kd_after_tax = (self.cfg.taxa_lliure_risc + 0.015) * (1.0 - 0.21)
-            wacc = we * ke + wd * kd_after_tax
-        else:
-            wacc = ke
+        tot = deute + cap
+        if tot <= 0 or deute <= 0:
+            return float(np.clip(ke, 0.055, 0.16))
+        cov = _num(m.get("Cobertura d'Interessos"))
+        spread = 0.010 if (cov is None or cov > 8) else 0.015 if cov > 4 else 0.030 if cov > 2 else 0.050
+        kd = (self.cfg.taxa_lliure_risc + spread) * (1.0 - self.cfg.taxa_impostos)
+        wacc = (cap / tot) * ke + (deute / tot) * kd
         return float(np.clip(wacc, 0.055, 0.16))
 
+    # ---------------------------------------------------------------- puntuació
     def calcular_puntuacio_1_any(self) -> Dict[str, Any]:
-        """
-        Calcula una puntuació quantitativa de 0 a 100 optimitzada per a un horitzó d'1 any.
-        Pesos dels blocs:
-        - Valoració (22%): PER Forward/Trailing, EV/EBITDA, PEG, FCF Yield
-        - Rendibilitat i Qualitat (23%): Marge Operatiu, ROE, ROA, Marge Net
-        - Creixement (20%): Creixement Ingressos, Creixement Beneficis, FCF CAGR
-        - Salut Financera i Risc (20%): Deute Net/EBITDA, Current Ratio, Max Drawdown 1Y, Volatilitat
-        - Momentum i Tècnic 1Y (15%): Distància SMA200, Distància SMA50, RSI(14) equilibrat, Rendiment 1Y
-        """
-        m = self.extreure_metriques_completes()
+        m = self.metriques()
         wacc = self.estimar_wacc()
+        per_anc, ev_anc = ANCORES_SECTOR.get(self.sector, ANCORA_DEFECTE)
 
-        per = m["PER Forward"] if (m["PER Forward"] and m["PER Forward"] > 0) else m["PER Trailing"]
-        # Si PER <= 0 (pèrdues), la puntuació del múltiple és 0
-        p_per = 0.0 if (per is not None and per <= 0) else _interp_score(per, worst=40.0, best=14.0, higher_is_better=False)
+        pf = m["PER Forward"]
+        per = pf if (pf and pf > 0) else m["PER Trailing"]
+        p_per = 0.0 if (per is not None and per <= 0) else _interp_score(per, 2.0 * per_anc, 0.65 * per_anc)
         peg = m["PEG"]
-        p_peg = 0.0 if (peg is not None and peg <= 0) else _interp_score(peg, worst=3.0, best=1.0, higher_is_better=False)
-        ev_ebitda = m["EV/EBITDA"]
-        p_ev = 0.0 if (ev_ebitda is not None and ev_ebitda <= 0) else _interp_score(ev_ebitda, worst=26.0, best=9.0, higher_is_better=False)
-        p_fcf_y = _interp_score(m["FCF Yield"], worst=0.0, best=0.07, higher_is_better=True)
+        p_peg = 0.0 if (peg is not None and peg <= 0) else _interp_score(peg, 3.0, 1.0)
+        ev = m["EV/EBITDA"]
+        p_ev = 0.0 if (ev is not None and ev <= 0) else _interp_score(ev, 1.9 * ev_anc, 0.65 * ev_anc)
+        p_fcfy = _interp_score(m["FCF Yield"], 0.0, 0.07)
+        p_pb = _interp_score(m["P/BV"], 2.5, 0.8)
 
-        # RSI òptim a prop de 50-55; penalitzat si és molt alt (>75) o extremadament baix (<25)
         rsi = m["RSI (14)"]
         p_rsi = None
         if rsi is not None:
@@ -321,216 +420,317 @@ class BotInversio1Any:
             else:
                 p_rsi = _clip01(1.0 - (42.0 - rsi) / 25.0)
 
-        blocs_def = {
-            "Valoració": [
-                ("PER (Forward/Trailing)", p_per, 0.35),
-                ("EV / EBITDA", p_ev, 0.30),
-                ("PEG Ratio", p_peg, 0.20),
-                ("FCF Yield", p_fcf_y, 0.15),
-            ],
-            "Rendibilitat": [
-                ("Marge Operatiu", _interp_score(m["Marge Operatiu"], 0.02, 0.28, True), 0.35),
-                ("ROE", _interp_score(m["ROE"], 0.0, 0.25, True), 0.30),
-                ("ROA", _interp_score(m["ROA"], 0.0, 0.12, True), 0.20),
-                ("Marge Net", _interp_score(m["Marge Net"], 0.0, 0.22, True), 0.15),
-            ],
-            "Creixement": [
-                ("Creixement Ingressos YoY", _interp_score(m["Creixement Ingressos YoY"], -0.05, 0.20, True), 0.40),
-                ("Creixement Beneficis YoY", _interp_score(m["Creixement Beneficis YoY"], -0.10, 0.25, True), 0.40),
-                ("FCF CAGR Històric", _interp_score(m["FCF CAGR Històric"], -0.05, 0.15, True), 0.20),
-            ],
-            "Salut i Risc": [
-                ("Deute Net / EBITDA", _interp_score(m["Deute Net / EBITDA"], 4.0, 0.0, False), 0.30),
-                ("Current Ratio", _interp_score(m["Current Ratio"], 0.75, 2.0, True), 0.20),
-                ("Max Drawdown 1Y", _interp_score(m["Max Drawdown 1Y"], -0.45, -0.08, True), 0.25),
-                ("Volatilitat Anual", _interp_score(m["Volatilitat Anualitzada"], 0.60, 0.18, False), 0.25),
-            ],
-            "Momentum 1Y": [
-                ("Preu vs SMA200", _interp_score(m["Distància SMA200"], -0.25, 0.15, True), 0.40),
-                ("Preu vs SMA50", _interp_score(m["Distància SMA50"], -0.15, 0.10, True), 0.25),
-                ("RSI (14) Equilibrat", p_rsi, 0.15),
-                ("Rendiment 1Y", _interp_score(m["Rendiment 1Y"], -0.20, 0.30, True), 0.20),
-            ],
-        }
-
-        pesos_blocs = {
-            "Valoració": 0.22,
-            "Rendibilitat": 0.23,
-            "Creixement": 0.20,
-            "Salut i Risc": 0.20,
-            "Momentum 1Y": 0.15,
-        }
-
-        puntuacio_blocs: Dict[str, Optional[float]] = {}
-        detall_indicadors: List[Dict[str, Any]] = []
-        total_disponibles = 0
-        total_possibles = 0
-
-        pes_efectiu_total = 0.0
-        suma_ponderada = 0.0
-
-        for nom_bloc, items in blocs_def.items():
-            num_b = 0.0
-            den_b = 0.0
-            for nom_ind, score_val, peso_ind in items:
-                total_possibles += 1
-                if score_val is not None:
-                    total_disponibles += 1
-                    num_b += score_val * peso_ind
-                    den_b += peso_ind
-                    detall_indicadors.append({
-                        "Bloc": nom_bloc,
-                        "Indicador": nom_ind,
-                        "Valor": m.get(nom_ind),
-                        "Puntuació (0-100)": round(score_val * 100.0, 1),
-                    })
-                else:
-                    detall_indicadors.append({
-                        "Bloc": nom_bloc,
-                        "Indicador": nom_ind,
-                        "Valor": None,
-                        "Puntuació (0-100)": None,
-                    })
-
-            if den_b > 0:
-                score_bloc_100 = (num_b / den_b) * 100.0
-                puntuacio_blocs[nom_bloc] = round(score_bloc_100, 1)
-                peso_b = pesos_blocs[nom_bloc]
-                suma_ponderada += score_bloc_100 * peso_b
-                pes_efectiu_total += peso_b
-            else:
-                puntuacio_blocs[nom_bloc] = None
-
-        puntuacio_global = round(suma_ponderada / pes_efectiu_total, 1) if pes_efectiu_total > 0 else 0.0
-        cobertura = round((total_disponibles / total_possibles) * 100.0, 1) if total_possibles > 0 else 0.0
-
-        if puntuacio_global >= 75:
-            dictamen = "FORTAMENT RECOMANABLE (1Y)"
-        elif puntuacio_global >= 60:
-            dictamen = "COMPRAR / SOBREPONDERAR (1Y)"
-        elif puntuacio_global >= 45:
-            dictamen = "NEUTRAL / MANTENIR EN OBSERVACIÓ"
+        S = _interp_score
+        if self.es_financera:
+            # Bancs/asseguradores: EBITDA, deute net i current ratio no tenen sentit.
+            blocs = {
+                "Valoració": [
+                    ("PER (Forward/Trailing)", per, p_per, 0.45),
+                    ("P/BV", m["P/BV"], p_pb, 0.40),
+                    ("PEG", peg, p_peg, 0.15),
+                ],
+                "Rendibilitat": [
+                    ("ROE", m["ROE"], S(m["ROE"], 0.04, 0.16), 0.55),
+                    ("ROA", m["ROA"], S(m["ROA"], 0.0, 0.015), 0.25),
+                    ("Marge Net", m["Marge Net"], S(m["Marge Net"], 0.05, 0.30), 0.20),
+                ],
+                "Creixement": [
+                    ("Creixement Ingressos YoY", m["Creixement Ingressos YoY"], S(m["Creixement Ingressos YoY"], -0.05, 0.15), 0.50),
+                    ("Creixement Beneficis YoY", m["Creixement Beneficis YoY"], S(m["Creixement Beneficis YoY"], -0.10, 0.20), 0.50),
+                ],
+                "Salut i Risc": [
+                    ("Max Drawdown 1Y", m["Max Drawdown 1Y"], S(m["Max Drawdown 1Y"], -0.45, -0.08), 0.50),
+                    ("Volatilitat Anualitzada", m["Volatilitat Anualitzada"], S(m["Volatilitat Anualitzada"], 0.55, 0.18), 0.50),
+                ],
+            }
         else:
-            dictamen = "POC RECOMANABLE / CAUTELA ELEVADA"
+            blocs = {
+                "Valoració": [
+                    ("PER (Forward/Trailing)", per, p_per, 0.35),
+                    ("EV/EBITDA", ev, p_ev, 0.30),
+                    ("PEG", peg, p_peg, 0.20),
+                    ("FCF Yield", m["FCF Yield"], p_fcfy, 0.15),
+                ],
+                "Rendibilitat": [
+                    ("Marge Operatiu", m["Marge Operatiu"], S(m["Marge Operatiu"], 0.02, 0.28), 0.30),
+                    ("ROE", m["ROE"], S(m["ROE"], 0.0, 0.25), 0.30),
+                    ("ROA", m["ROA"], S(m["ROA"], 0.0, 0.12), 0.15),
+                    ("Marge Net", m["Marge Net"], S(m["Marge Net"], 0.0, 0.22), 0.15),
+                    ("Conversió FCF/Benefici", m["Conversió FCF/Benefici"], S(m["Conversió FCF/Benefici"], 0.5, 1.1), 0.10),
+                ],
+                "Creixement": [
+                    ("Creixement Ingressos YoY", m["Creixement Ingressos YoY"], S(m["Creixement Ingressos YoY"], -0.05, 0.20), 0.40),
+                    ("Creixement Beneficis YoY", m["Creixement Beneficis YoY"], S(m["Creixement Beneficis YoY"], -0.10, 0.25), 0.40),
+                    ("FCF CAGR Històric", m["FCF CAGR Històric"], S(m["FCF CAGR Històric"], -0.05, 0.15), 0.20),
+                ],
+                "Salut i Risc": [
+                    ("Deute Net / EBITDA", m["Deute Net / EBITDA"], S(m["Deute Net / EBITDA"], 4.0, 0.0), 0.25),
+                    ("Cobertura d'Interessos", m["Cobertura d'Interessos"], S(m["Cobertura d'Interessos"], 2.0, 12.0), 0.15),
+                    ("Current Ratio", m["Current Ratio"], S(m["Current Ratio"], 0.75, 2.0), 0.15),
+                    ("Max Drawdown 1Y", m["Max Drawdown 1Y"], S(m["Max Drawdown 1Y"], -0.45, -0.08), 0.20),
+                    ("Volatilitat Anualitzada", m["Volatilitat Anualitzada"], S(m["Volatilitat Anualitzada"], 0.60, 0.18), 0.25),
+                ],
+            }
+        blocs["Momentum 1Y"] = [
+            ("Momentum 12-1", m["Momentum 12-1"], S(m["Momentum 12-1"], -0.25, 0.40), 0.35),
+            ("Distància SMA200", m["Distància SMA200"], S(m["Distància SMA200"], -0.25, 0.15), 0.30),
+            ("Distància SMA50", m["Distància SMA50"], S(m["Distància SMA50"], -0.15, 0.10), 0.15),
+            ("RSI (14) Equilibrat", rsi, p_rsi, 0.10),
+            ("Rendiment 1Y", m["Rendiment 1Y"], S(m["Rendiment 1Y"], -0.20, 0.30), 0.10),
+        ]
+        pesos_blocs = {"Valoració": 0.25, "Rendibilitat": 0.22, "Creixement": 0.18, "Salut i Risc": 0.20, "Momentum 1Y": 0.15}
+
+        punt_blocs: Dict[str, Optional[float]] = {}
+        detall: List[Dict[str, Any]] = []
+        disp = poss = 0
+        suma = pes_tot = 0.0
+        for nom_b, items in blocs.items():
+            num = den = 0.0
+            for nom_i, valor, sc, w in items:
+                poss += 1
+                if sc is not None:
+                    disp += 1
+                    num += sc * w
+                    den += w
+                detall.append({
+                    "Bloc": nom_b, "Indicador": nom_i, "Valor": valor,
+                    "Puntuació (0-100)": None if sc is None else round(sc * 100.0, 1),
+                })
+            if den > 0:
+                s100 = num / den * 100.0
+                punt_blocs[nom_b] = round(s100, 1)
+                suma += s100 * pesos_blocs[nom_b]
+                pes_tot += pesos_blocs[nom_b]
+            else:
+                punt_blocs[nom_b] = None
+
+        bruta = suma / pes_tot if pes_tot > 0 else 50.0
+        cobertura = disp / poss * 100.0 if poss else 0.0
+        # Shrinkage cap a 50 segons la cobertura: poques dades => menys extrem
+        ajustada = 50.0 + (bruta - 50.0) * (0.5 + 0.5 * cobertura / 100.0)
 
         return {
-            "puntuacio_global": puntuacio_global,
-            "dictamen": dictamen,
-            "cobertura_dades_pct": cobertura,
+            "puntuacio_bruta": round(bruta, 1),
+            "puntuacio_global": round(ajustada, 1),
+            "puntuacio_ajustada": round(ajustada, 1),
+            "dictamen": self._dictamen(ajustada),
+            "cobertura_dades_pct": round(cobertura, 1),
             "wacc_estimat": round(wacc * 100.0, 2),
-            "blocs": puntuacio_blocs,
-            "detall": pd.DataFrame(detall_indicadors),
+            "blocs": punt_blocs,
+            "detall": pd.DataFrame(detall),
         }
 
-    def estimar_objectiu_1_any(self) -> Dict[str, Any]:
-        """
-        Estima el preu objectiu a 1 any combinant:
-        1) Valoració per creixement esperat + múltiple objectiu ajustat per qualitat/WACC.
-        2) Simulació de Monte Carlo (GBM) sobre 252 dies hàbils amb deriva combinada.
-        """
-        m = self.extreure_metriques_completes()
-        wacc = self.estimar_wacc()
-        p0 = float(self.preu_actual)
+    @staticmethod
+    def _dictamen(x: float) -> str:
+        if x >= 75:
+            return "FORTAMENT RECOMANABLE (1Y)"
+        if x >= 60:
+            return "COMPRAR / SOBREPONDERAR (1Y)"
+        if x >= 45:
+            return "NEUTRAL / MANTENIR EN OBSERVACIÓ"
+        return "POC RECOMANABLE / CAUTELA ELEVADA"
 
-        # 1. Taxa de creixement esperada a 1 any amb shrinkage cap a la mitjana
-        fonts_g = [
-            _num(m["Creixement Ingressos YoY"]),
-            _num(m["Creixement Beneficis YoY"]),
-            _num(m["FCF CAGR Històric"]),
+    # --------------------------------------------------------------- valoració
+    def _creixement_esperat(self, m: Dict[str, Optional[float]]) -> float:
+        fonts = [
+            (_num(m["Creixement Ingressos YoY"]), 0.40, (-0.25, 0.40)),
+            (_num(m["Creixement Beneficis YoY"]), 0.30, (-0.25, 0.35)),
+            (_num(m["FCF CAGR Històric"]), 0.30, (-0.25, 0.35)),
         ]
-        g_vals = [float(np.clip(x, -0.25, 0.45)) for x in fonts_g if x is not None]
-        g_raw = float(np.mean(g_vals)) if g_vals else 0.05
-        # Shrinkage 60% dada observada + 40% base conservadora 5%
-        g_1y = float(np.clip(0.60 * g_raw + 0.40 * 0.05, -0.20, 0.35))
+        vals = [(float(np.clip(v, *r)), w) for v, w, r in fonts if v is not None]
+        base = 0.05
+        if not vals:
+            return base
+        g_raw = sum(v * w for v, w in vals) / sum(w for _, w in vals)
+        lam = min(0.80, 0.35 + 0.15 * len(vals))  # menys fonts => més pes a la base
+        return float(np.clip(lam * g_raw + (1 - lam) * base, -0.20, 0.30))
 
-        # 2. Estimació de preu fonamental a 1 any via Forward EPS o FCF/acció
-        eps_fwd = _num(m["EPS Forward"])
-        eps_tr = _num(m["EPS Trailing"])
-        per_actual = _num(m["PER Forward"]) or _num(m["PER Trailing"])
+    def _valoracions_fonamentals(self, m, g, wacc, ke) -> Dict[str, Dict[str, float]]:
+        """Ensemble de mètodes. Retorna {mètode: {preu, pes}} (preu a 12 mesos)."""
+        p0 = float(self.preu_actual)
+        per_anc, ev_anc = ANCORES_SECTOR.get(self.sector, ANCORA_DEFECTE)
+        gt = self.cfg.creixement_terminal
+        out: Dict[str, Dict[str, float]] = {}
+        lo, hi = 0.55 * p0, 1.65 * p0
+        put = lambda nom, preu, pes: out.__setitem__(nom, {"preu": float(np.clip(preu, lo, hi)), "pes": pes})  # noqa: E731
 
-        # Múltiple objectiu moderat (ancorat al múltiple actual acotat i ajustat per WACC/creixement)
-        if per_actual and per_actual > 0:
-            multiple_base = float(np.clip(per_actual, 8.0, 35.0))
-            # Ajust suau segons diferencial creixement vs WACC
-            factor_mult = float(np.clip(1.0 + 0.5 * (g_1y - (wacc - 0.05)), 0.80, 1.20))
-            multiple_obj = multiple_base * factor_mult
+        cap = _num(self.info.get("marketCap"))
+        shares = (cap / p0) if (cap and cap > 0) else None
+        deute, caixa = _num(m["Deute Total"]) or 0.0, _num(m["Caixa Total"]) or 0.0
+        deute_net = deute - caixa
+        ajust_g = float(np.clip(1.0 + 0.4 * (g - 0.07), 0.85, 1.15))
+
+        if not self.fx_mismatch:
+            # 1) P/E amb múltiple revertit cap a l'àncora sectorial
+            eps_f, eps_t = _num(m["EPS Forward"]), _num(m["EPS Trailing"])
+            if eps_f and eps_f > 0:
+                eps1, per_ref = eps_f * (1 + g) ** 0.75, p0 / eps_f
+            elif eps_t and eps_t > 0:
+                eps1, per_ref = eps_t * (1 + g) ** 1.5, p0 / eps_t
+            else:
+                eps1 = per_ref = None
+            if eps1:
+                mult = (0.5 * float(np.clip(per_ref, 6.0, 45.0)) + 0.5 * per_anc) * ajust_g
+                put("P/E (múltiple revertit)", eps1 * mult, 0.35)
+
+            if self.es_financera:
+                # 2f) P/BV justificat: (ROE - g) / (ke - g)
+                bv, roe = _num(m["Valor Comptable/Acció"]), _num(m["ROE"])
+                if bv and bv > 0 and roe is not None:
+                    roe_c = float(np.clip(roe, 0.04, 0.22))
+                    pb_just = (roe_c - gt) / max(ke - gt, 0.03)
+                    pb_act = _num(m["P/BV"]) or (p0 / bv)
+                    pb_obj = 0.5 * pb_just + 0.5 * float(np.clip(pb_act, 0.4, 3.5))
+                    payout = float(np.clip(_num(self.info.get("payoutRatio")) or 0.4, 0.0, 1.0))
+                    bv1 = bv * (1 + roe_c * (1 - payout))
+                    put("P/BV justificat", bv1 * pb_obj, 0.40)
+            else:
+                # 2) EV/EBITDA
+                ebitda = _num(m.get("EBITDA")) or _num(self.info.get("ebitda"))
+                ev_act = _num(m["EV/EBITDA"])
+                if ebitda and ebitda > 0 and shares:
+                    mult = 0.5 * float(np.clip(ev_act if ev_act else ev_anc, 4.0, 30.0)) + 0.5 * ev_anc
+                    eq = mult * ajust_g * ebitda * (1 + g) ** 1.5 - deute_net
+                    if eq > 0:
+                        put("EV/EBITDA (múltiple revertit)", eq / shares, 0.20)
+                # 3) DCF (FCF a l'accionista descomptat a ke, 5 anys amb fade al creixement terminal)
+                fcf0 = _num(m["FCF Actual"])
+                if fcf0 and fcf0 > 0 and shares:
+                    g0 = float(np.clip(g, -0.05, 0.18))
+                    r = max(ke, gt + 0.03)
+                    fcf, pv = fcf0, 0.0
+                    for t in range(1, 6):
+                        gt_t = g0 + (gt - g0) * (t - 1) / 4.0
+                        fcf *= 1 + gt_t
+                        pv += fcf / (1 + r) ** t
+                    pv += fcf * (1 + gt) / (r - gt) / (1 + r) ** 5
+                    put("DCF (FCF a ke)", pv / shares * (1 + ke), 0.20)
+
+        # 4) Consens d'analistes amb haircut (els targets tenen biaix optimista)
+        tgt, n = _num(m["Target Analyst Consensus"]), _num(m["Nº Analistes"])
+        if tgt and tgt > 0:
+            imp = tgt / p0 - 1.0
+            pes = 0.15 if (n or 0) < 5 else 0.25 if (n or 0) < 15 else 0.30
+            put("Consens analistes (shrunk)", p0 * (1 + self.cfg.shrink_analistes * imp), pes)
+        return out
+
+    # ------------------------------------------------------------ preu objectiu
+    def estimar_objectiu_1_any(self) -> Dict[str, Any]:
+        m = self.metriques()
+        ke, wacc = self._ke(), self.estimar_wacc()
+        p0 = float(self.preu_actual)
+        g_1y = self._creixement_esperat(m)
+
+        vals = self._valoracions_fonamentals(m, g_1y, wacc, ke)
+        pf = r_fund = None
+        dispersio = 0.25
+        detall_val = []
+        if vals:
+            w = np.array([v["pes"] for v in vals.values()])
+            pr = np.array([v["preu"] for v in vals.values()])
+            w = w / w.sum()
+            pf = float(np.sum(w * pr))
+            r_fund = pf / p0 - 1.0
+            rets = pr / p0 - 1.0
+            dispersio = float(np.sqrt(np.sum(w * (rets - r_fund) ** 2))) if len(vals) >= 2 else 0.20
+            for (nom, v), wi in zip(vals.items(), w):
+                detall_val.append({"Mètode": nom, "Preu 12m": round(v["preu"], 2),
+                                   "Upside %": round((v["preu"] / p0 - 1) * 100, 1), "Pes %": round(wi * 100, 1)})
+
+        dy = float(np.clip(_num(m["Rendiment Dividend"]) or 0.0, 0.0, 0.12))
+        mu_capm_preu = ke - dy
+        mom = _num(m["Momentum 12-1"])
+        tilt = 0.03 * float(np.tanh(mom / 0.30)) if mom is not None else 0.0  # prima de momentum (modesta)
+        if r_fund is not None:
+            w_capm = float(np.clip(self.cfg.pes_capm + dispersio, 0.35, 0.80))
+            mu_preu = w_capm * mu_capm_preu + (1 - w_capm) * float(np.clip(r_fund, -0.45, 0.65)) + tilt
         else:
-            multiple_obj = 18.0
+            w_capm = 1.0
+            mu_preu = mu_capm_preu + tilt
+        mu_preu = float(np.clip(mu_preu, -0.40, 0.60))
 
-        preu_fonamental_1y = None
-        if eps_fwd and eps_fwd > 0:
-            eps_1y = eps_fwd * (1.0 + 0.5 * g_1y)
-            preu_fonamental_1y = eps_1y * multiple_obj
-        elif eps_tr and eps_tr > 0:
-            eps_1y = eps_tr * ((1.0 + g_1y) ** 1.5)
-            preu_fonamental_1y = eps_1y * multiple_obj
-        else:
-            fcf_act = _num(m["FCF Actual"])
-            accions = _num(m["Accions"])
-            if fcf_act and fcf_act > 0 and accions and accions > 0:
-                fcf_ps_1y = (fcf_act * (1.0 + g_1y)) / accions
-                # Múltiple P/FCF objectiu ~ 1 / max(wacc - g_terminal, 0.04) acotat
-                mult_fcf = float(np.clip(1.0 / max(wacc - self.cfg.creixement_terminal, 0.045), 10.0, 25.0))
-                preu_fonamental_1y = fcf_ps_1y * mult_fcf
-
-        # 3. Simulació Monte Carlo (GBM, 252 dies)
-        close = self.hist_1y["Close"]
-        log_rets = np.log(close / close.shift(1)).dropna()
-        vol_diaria = float(log_rets.std()) if len(log_rets) > 10 else 0.015
-        mu_hist_diari = float(log_rets.mean()) if len(log_rets) > 10 else 0.0
-
-        # Deriva diària anualitzada: combina històrica i, si existeix preu fonamental, parcialment cap a ell
-        mu_anual_hist = mu_hist_diari * self.cfg.dies_any
-        if preu_fonamental_1y and preu_fonamental_1y > 0:
-            ret_fonamental_1y = (preu_fonamental_1y / p0) - 1.0
-            ret_fonamental_acotat = float(np.clip(ret_fonamental_1y, -0.45, 0.65))
-            mu_anual_obj = 0.50 * mu_anual_hist + 0.50 * ret_fonamental_acotat
-        else:
-            ret_fonamental_1y = None
-            mu_anual_obj = mu_anual_hist
-
-        mu_diari = mu_anual_obj / self.cfg.dies_any
-        drift_diari = mu_diari - 0.5 * (vol_diaria ** 2)
+        close = self.hist_full["Close"]
+        lr = np.log(close / close.shift(1)).dropna()
+        vol_d = self._vol_pronostic(lr)
 
         rng = np.random.default_rng(self.cfg.seed)
-        Z = rng.standard_normal((self.cfg.dies_any, self.cfg.n_simulacions))
-        increments = np.exp(drift_diari + vol_diaria * Z)
-
-        rutes = np.empty((self.cfg.dies_any + 1, self.cfg.n_simulacions), dtype=float)
-        rutes[0] = p0
-        rutes[1:] = p0 * np.cumprod(increments, axis=0)
-
+        rutes = simular_rutes(p0, float(np.log1p(mu_preu)), vol_d, self.cfg.dies_any,
+                              self.cfg.n_simulacions, rng, self.cfg.df_t, self.cfg.sigma_vol_incert)
         finals = rutes[-1]
-        p_mitjana = float(np.mean(finals))
-        p_mediana = float(np.median(finals))
-        p_best_95 = float(np.percentile(finals, 95))
-        p_worst_5 = float(np.percentile(finals, 5))
-        p_best_75 = float(np.percentile(finals, 75))
-        p_worst_25 = float(np.percentile(finals, 25))
-        prob_positiu = float(np.mean(finals > p0) * 100.0)
-
-        # Preu objectiu final combinat (fonamental + mediana Monte Carlo)
-        if preu_fonamental_1y and preu_fonamental_1y > 0:
-            w_f = self.cfg.pes_fonamental_preu
-            preu_objectiu = w_f * preu_fonamental_1y + (1.0 - w_f) * p_mediana
-        else:
-            preu_objectiu = p_mediana
-
-        upside_pct = ((preu_objectiu / p0) - 1.0) * 100.0
+        mitjana, mediana = float(np.mean(finals)), float(np.median(finals))
+        p5, p25, p75, p95 = (float(np.percentile(finals, q)) for q in (5, 25, 75, 95))
+        cua = finals[finals <= p5]
+        cvar = float(np.mean(cua)) if len(cua) else p5
 
         return {
             "preu_actual": p0,
-            "preu_objectiu_1y": round(preu_objectiu, 2),
-            "upside_objectiu_pct": round(upside_pct, 2),
-            "preu_fonamental_1y": round(preu_fonamental_1y, 2) if preu_fonamental_1y else None,
-            "creixement_esperat_1y_pct": round(g_1y * 100.0, 2),
-            "mc_mitjana": round(p_mitjana, 2),
-            "mc_mediana": round(p_mediana, 2),
-            "mc_best_case_p95": round(p_best_95, 2),
-            "mc_worst_case_p5": round(p_worst_5, 2),
-            "mc_p75": round(p_best_75, 2),
-            "mc_p25": round(p_worst_25, 2),
-            "prob_rendiment_positiu_pct": round(prob_positiu, 1),
+            "preu_objectiu_1y": round(mitjana, 2),
+            "upside_objectiu_pct": round((mitjana / p0 - 1) * 100, 2),
+            "rend_total_esperat_pct": round((mu_preu + dy) * 100, 2),
+            "rend_dividend_pct": round(dy * 100, 2),
+            "preu_fonamental_1y": round(pf, 2) if pf else None,
+            "dispersio_valoracio_pct": round(dispersio * 100, 1),
+            "pes_capm_pct": round(w_capm * 100, 0),
+            "detall_valoracio": pd.DataFrame(detall_val),
+            "creixement_esperat_1y_pct": round(g_1y * 100, 2),
+            "cost_equity_pct": round(ke * 100, 2),
+            "vol_pronostic_anual_pct": round(vol_d * np.sqrt(252) * 100, 1),
+            "mc_mitjana": round(mitjana, 2),
+            "mc_mediana": round(mediana, 2),
+            "mc_best_case_p95": round(p95, 2),
+            "mc_worst_case_p5": round(p5, 2),
+            "mc_p75": round(p75, 2),
+            "mc_p25": round(p25, 2),
+            "prob_rendiment_positiu_pct": round(float(np.mean(finals > p0) * 100), 1),
+            "prob_perdua_20_pct": round(float(np.mean(finals < 0.8 * p0) * 100), 1),
+            "var95_1y_pct": round((p5 / p0 - 1) * 100, 1),
+            "cvar95_1y_pct": round((cvar / p0 - 1) * 100, 1),
             "rutes": rutes,
             "finals": finals,
+        }
+
+    # ---------------------------------------------------------- senyal combinat
+    def dictamen_combinat(self, score_res: Dict[str, Any], obj_res: Dict[str, Any]) -> Tuple[float, str]:
+        """Barreja qualitat (puntuació) i rendiment esperat, penalitzant el risc de cua."""
+        s = score_res["puntuacio_ajustada"]
+        r = obj_res["rend_total_esperat_pct"] / 100.0
+        s_ret = 50.0 + 50.0 * float(np.clip(r / 0.25, -1, 1))
+        comp = 0.5 * s + 0.5 * s_ret - 0.3 * max(0.0, obj_res["prob_perdua_20_pct"] - 10.0)
+        comp = float(np.clip(comp, 0, 100))
+        return round(comp, 1), self._dictamen(comp)
+
+    # --------------------------------------------------------------- calibratge
+    def calibratge_mc(self, pas: int = 21, n_sim: int = 800) -> Optional[Dict[str, float]]:
+        """
+        Backtest walk-forward del Monte Carlo (vol. + cues + deriva CAPM) sobre l'històric.
+        Una bona calibració dóna ~90% de cobertura P5–P95 i ~50% a P25–P75.
+        Finestres solapades: els resultats són orientatius, no independents.
+        """
+        close = self.hist_full["Close"]
+        T, n = self.cfg.dies_any, len(close)
+        if n < 2 * T + 60:
+            return None
+        rng = np.random.default_rng(self.cfg.seed + 1)
+        mu_c = float(np.log1p(self._ke()))
+        dins90 = dins50 = 0
+        pits, biaix = [], []
+        for t in range(T, n - T, pas):
+            past = close.iloc[: t + 1]
+            lr = np.log(past / past.shift(1)).dropna()
+            ruta = simular_rutes(float(past.iloc[-1]), mu_c, self._vol_pronostic(lr), T, n_sim, rng,
+                                 self.cfg.df_t, self.cfg.sigma_vol_incert)
+            f = ruta[-1]
+            real = float(close.iloc[t + T])
+            q5, q25, q50, q75, q95 = np.percentile(f, [5, 25, 50, 75, 95])
+            dins90 += int(q5 <= real <= q95)
+            dins50 += int(q25 <= real <= q75)
+            pits.append(float(np.mean(f < real)))
+            biaix.append(float(np.log(real / q50)))
+        k = len(pits)
+        return {
+            "n_origens": k,
+            "cobertura_p5_p95_pct": round(dins90 / k * 100, 1),
+            "cobertura_p25_p75_pct": round(dins50 / k * 100, 1),
+            "pit_mitja": round(float(np.mean(pits)), 3),
+            "biaix_mediana_pct": round(float(np.mean(biaix)) * 100, 1),
         }
